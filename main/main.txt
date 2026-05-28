@@ -1,0 +1,192 @@
+/*
+ * SPDX-License-Identifier: Unlicense
+ *
+ * Minimal USB HID RAW dump example
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_err.h"
+
+#include "usb/usb_host.h"
+#include "usb/hid_host.h"
+
+static const char *TAG = "hid_raw";
+
+/* ================= USB LIB TASK ================= */
+
+static void usb_lib_task(void *arg)
+{
+    usb_host_config_t cfg = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+
+    ESP_ERROR_CHECK(usb_host_install(&cfg));
+    xTaskNotifyGive((TaskHandle_t)arg);
+
+    while (1)
+    {
+        uint32_t flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+
+        if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
+        {
+            ESP_LOGI(TAG, "No more clients");
+            usb_host_device_free_all();
+            break;
+        }
+    }
+
+    usb_host_uninstall();
+    vTaskDelete(NULL);
+}
+
+/* ================= HID INTERFACE CALLBACK ================= */
+static void hid_interface_cb(hid_host_device_handle_t dev_handle,
+                             hid_host_interface_event_t event,
+                             void *arg)
+{
+    switch (event)
+    {
+    case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
+    {
+        uint8_t data[64];
+        size_t len = 0;
+
+        esp_err_t err = hid_host_device_get_raw_input_report_data(
+            dev_handle, data, sizeof(data), &len);
+
+        if (err == ESP_ERR_INVALID_STATE)
+        {
+            ESP_LOGW(TAG, "Device invalid state, waiting reconnect");
+            return;
+        }
+
+        if (err != ESP_OK || len == 0)
+        {
+            return;
+        }
+
+        printf("RAW [%02d]: ", len);
+        for (int i = 0; i < len; i++)
+        {
+            printf("%02X ", data[i]);
+        }
+        printf("\n");
+        break;
+    }
+
+    case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
+    {
+        ESP_LOGI(TAG, "HID Interface DISCONNECTED - device likely unplugged or failed");
+        // Optional: You can add hid_host_device_close(dev_handle); here if desired
+        break;
+    }
+
+    case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
+    {
+        ESP_LOGE(TAG, "HID Transfer Error occurred");
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/* ================= HID DEVICE CALLBACK ================= */
+
+static void hid_device_cb(hid_host_device_handle_t dev_handle,
+                          hid_host_driver_event_t event,
+                          void *arg)
+{
+    hid_host_dev_params_t params;
+    hid_host_device_get_params(dev_handle, &params);
+
+    switch (event)
+    {
+
+    case HID_HOST_DRIVER_EVENT_CONNECTED:
+    {
+        ESP_LOGI(TAG,
+                 "HID CONNECTED | proto=%d subclass=%d iface=%d",
+                 params.proto, params.sub_class, params.iface_num);
+
+        hid_host_device_config_t cfg = {
+            .callback = hid_interface_cb,
+            .callback_arg = NULL,
+        };
+
+        ESP_ERROR_CHECK(hid_host_device_open(dev_handle, &cfg));
+        ESP_ERROR_CHECK(hid_host_device_start(dev_handle));
+
+        // Tạm comment phần gửi output vì API chưa có
+        /*
+        uint8_t output_data[8] = {0x00};  // dummy
+        esp_err_t err = hid_host_device_set_output_report(dev_handle, output_data, sizeof(output_data));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Sent output report OK");
+        } else {
+            ESP_LOGE(TAG, "Set output report failed: %s", esp_err_to_name(err));
+        }
+        */
+
+        break;
+    }
+
+        // case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
+        //     ESP_LOGI(TAG, "HID DISCONNECTED");
+        //     hid_host_device_close(dev_handle);
+        //     break;
+
+    default:
+        break;
+    }
+}
+
+/* ================= APP MAIN ================= */
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Starting HID RAW dump");
+
+    /* USB host background task */
+    xTaskCreatePinnedToCore(
+        usb_lib_task,
+        "usb_lib",
+        4096,
+        xTaskGetCurrentTaskHandle(),
+        2,
+        NULL,
+        0);
+
+    /* Wait USB ready */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    /* HID host driver */
+    hid_host_driver_config_t hid_cfg = {
+        .create_background_task = true,
+        .task_priority = 5,
+        .stack_size = 4096,
+        .core_id = 0,
+        .callback = hid_device_cb,
+        .callback_arg = NULL,
+    };
+
+    ESP_ERROR_CHECK(hid_host_install(&hid_cfg));
+
+    ESP_LOGI(TAG, "Plug HID device and watch raw data");
+
+    /* Nothing else to do */
+    while (1)
+    {
+        vTaskDelay(portMAX_DELAY);
+    }
+}
